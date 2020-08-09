@@ -49,7 +49,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
         impl #builder_name {
             #methods
 
-            pub fn build(&mut self) -> Result<#struct_name, Box<dyn std::error::Error>> {
+            pub fn build(&mut self) -> std::result::Result<#struct_name, std::boxed::Box<dyn std::error::Error>> {
                 Ok(#struct_name {
                     #struct_fields_from_builder
                 })
@@ -72,7 +72,7 @@ fn get_fields_with_option(data: &Data) -> TokenStream2 {
                         let ty = &f.ty;
                         let ty = extract_type_from_option(&ty);
                         quote! {
-                            #name: Option<#ty>,
+                            #name: std::option::Option<#ty>,
                         }
                     }).collect()
                 },
@@ -91,7 +91,7 @@ fn get_none_fields(data: &Data) -> TokenStream2 {
                     fields.named.iter().map(|f| {
                         let name = &f.ident;
                         quote! {
-                            #name: None,
+                            #name: std::option::Option::None,
                         }
                     }).collect()
                 },
