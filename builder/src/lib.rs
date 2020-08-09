@@ -15,6 +15,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
 
     let fields_with_option = get_fields_with_option(&input.data);
     let none_fields = get_none_fields(&input.data);
+    let methods = get_builder_methods(&input.data);
 
     let expanded = quote! {
         pub struct #builder_name { #fields_with_option }
@@ -25,6 +26,10 @@ pub fn derive(input: TokenStream) -> TokenStream {
                     #none_fields
                 }
             }
+        }
+
+        impl #builder_name {
+            #methods
         }
     };
 
@@ -60,6 +65,29 @@ fn get_none_fields(data: &Data) -> TokenStream2 {
                         let name = &f.ident;
                         quote! {
                             #name: None,
+                        }
+                    }).collect()
+                },
+                _ => unimplemented!(),
+            }
+        },
+        _ => unimplemented!(),
+    }
+}
+
+fn get_builder_methods(data: &Data) -> TokenStream2 {
+    match *data {
+        Data::Struct(ref data) => {
+            match data.fields {
+                Fields::Named(ref fields) => {
+                    fields.named.iter().map(|f| {
+                        let name = &f.ident;
+                        let ty = &f.ty;
+                        quote! {
+                            pub fn #name(&mut self, #name: #ty) -> &mut Self {
+                                self.#name = Some(#name);
+                                self
+                            }
                         }
                     }).collect()
                 },
