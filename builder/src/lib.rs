@@ -3,7 +3,7 @@ extern crate proc_macro;
 use quote::quote;
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use syn::{parse_macro_input, DeriveInput, Ident, Data, Fields, Type, PathArguments, GenericArgument};
+use syn::{parse_macro_input, DeriveInput, Ident, Data, Fields, Type, PathArguments, GenericArgument, Field, token::Comma, punctuated::Punctuated};
 
 #[proc_macro_derive(Builder)]
 pub fn derive(input: TokenStream) -> TokenStream {
@@ -12,49 +12,24 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let struct_name = input.ident;
 
     let builder_name = Ident::new(&format!("{}Builder", struct_name), Span::call_site());
+    let struct_fields = get_struct_fields(&input.data);
 
-    let fields_with_option = get_fields_with_option(&input.data);
-    let none_fields = get_none_fields(&input.data);
-    let methods = get_builder_methods(&input.data);
-    let struct_fields_from_builder = convert_builder_fields(&input.data);
+    let fields_with_option = envolve_fields_on_option(&struct_fields);
+    let none_fields = populate_fields_with_none(&struct_fields);
 
-    let builder_error = quote! {
-        #[derive(Debug)]
-        pub enum BuilderError {
-            NoneField(String),
-        }
+    let builder_struct_definition = create_builder_struct(&builder_name, fields_with_option);
+    let impl_builder_method_on_struct = impl_builder_method_on_struct(&struct_name, &builder_name, &none_fields);
 
-        impl std::error::Error for BuilderError {}
+    let impl_builder_methods = impl_builder_methods(&builder_name, &struct_name, &struct_fields);
 
-        impl std::fmt::Display for BuilderError {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                match self {
-                    Self::NoneField(s) => write!(f, "BuilderError::NoneField({})", s)
-                }
-            }
-        }
-    };
+    let builder_error = create_builder_error();
 
     let expanded = quote! {
-        pub struct #builder_name { #fields_with_option }
-        
-        impl #struct_name {
-            pub fn builder() -> #builder_name {
-                #builder_name {
-                    #none_fields
-                }
-            }
-        }
+        #builder_struct_definition
 
-        impl #builder_name {
-            #methods
+        #impl_builder_method_on_struct
 
-            pub fn build(&mut self) -> std::result::Result<#struct_name, std::boxed::Box<dyn std::error::Error>> {
-                Ok(#struct_name {
-                    #struct_fields_from_builder
-                })
-            }
-        }
+        #impl_builder_methods
 
         #builder_error
     };
@@ -62,19 +37,12 @@ pub fn derive(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-fn get_fields_with_option(data: &Data) -> TokenStream2 {
+fn get_struct_fields(data: &Data) -> Punctuated<Field, Comma> {
     match *data {
         Data::Struct(ref data) => {
             match data.fields {
                 Fields::Named(ref fields) => {
-                    fields.named.iter().map(|f| {
-                        let name = &f.ident;
-                        let ty = &f.ty;
-                        let ty = extract_type_from_option(&ty);
-                        quote! {
-                            #name: std::option::Option<#ty>,
-                        }
-                    }).collect()
+                    fields.named.clone()
                 },
                 _ => unimplemented!(),
             }
@@ -83,23 +51,24 @@ fn get_fields_with_option(data: &Data) -> TokenStream2 {
     }
 }
 
-fn get_none_fields(data: &Data) -> TokenStream2 {
-    match *data {
-        Data::Struct(ref data) => {
-            match data.fields {
-                Fields::Named(ref fields) => {
-                    fields.named.iter().map(|f| {
-                        let name = &f.ident;
-                        quote! {
-                            #name: std::option::Option::None,
-                        }
-                    }).collect()
-                },
-                _ => unimplemented!(),
-            }
-        },
-        _ => unimplemented!(),
-    }
+fn envolve_fields_on_option(fields: &Punctuated<Field, Comma>) -> TokenStream2 {
+    fields.iter().map(|f| {
+        let name = &f.ident;
+        let ty = &f.ty;
+        let ty = extract_type_from_option(&ty);
+        quote! {
+            #name: std::option::Option<#ty>,
+        }
+    }).collect()
+}
+
+fn populate_fields_with_none(fields: &Punctuated<Field, Comma>) -> TokenStream2 {
+    fields.iter().map(|f| {
+        let name = &f.ident;
+        quote! {
+            #name: std::option::Option::None,
+        }
+    }).collect()
 }
 
 fn is_option(ty: &Type) -> bool {
@@ -138,56 +107,97 @@ fn extract_type_from_option(ty: &Type) -> Type {
     ty.clone()
 }
 
-fn get_builder_methods(data: &Data) -> TokenStream2 {
-    match *data {
-        Data::Struct(ref data) => {
-            match data.fields {
-                Fields::Named(ref fields) => {
-                    fields.named.iter().map(|f| {
-                        let name = &f.ident;
-                        let ty = &f.ty;
+fn make_field_setters(fields: &Punctuated<Field, Comma>) -> TokenStream2 {
+    fields.iter().map(|f| {
+        let name = &f.ident;
+        let ty = &f.ty;
 
-                        let ty = extract_type_from_option(&ty);
-                        quote! {
-                            pub fn #name(&mut self, #name: #ty) -> &mut Self {
-                                self.#name = Some(#name);
-                                self
-                            }
-                        }
-                    }).collect()
-                },
-                _ => unimplemented!(),
+        let ty = extract_type_from_option(&ty);
+        quote! {
+            pub fn #name(&mut self, #name: #ty) -> &mut Self {
+                self.#name = Some(#name);
+                self
             }
-        },
-        _ => unimplemented!(),
+        }
+    }).collect()
+}
+
+fn make_build_method(struct_name: &Ident, struct_fields_from_builder: TokenStream2) -> TokenStream2 {
+    quote! {
+        pub fn build(&mut self) -> std::result::Result<#struct_name, std::boxed::Box<dyn std::error::Error>> {
+            Ok(#struct_name {
+                #struct_fields_from_builder
+            })
+        }
     }
 }
 
-fn convert_builder_fields(data: &Data) -> TokenStream2 {
-    match *data {
-        Data::Struct(ref data) => {
-            match data.fields {
-                Fields::Named(ref fields) => {
-                    fields.named.iter().map(|f| {
-                        let name = &f.ident;
-                        let ty = &f.ty;
-                        if is_option(ty) {
-                            quote! {
-                                #name: self.#name.clone(),
-                            }
-                        } else {
-                            quote! {
-                                #name: self.#name
-                                .as_ref()
-                                    .ok_or_else(|| BuilderError::NoneField(stringify!(#name).to_string()))?
-                                    .clone(),
-                            }
-                        }
-                    }).collect()
-                },
-                _ => unimplemented!(),
+fn populate_builder_fields_with_error_handling(fields: &Punctuated<Field, Comma>) -> TokenStream2 {
+    fields.iter().map(|f| {
+        let name = &f.ident;
+        let ty = &f.ty;
+        if is_option(ty) {
+            quote! {
+                #name: self.#name.clone(),
             }
-        },
-        _ => unimplemented!(),
+        } else {
+            quote! {
+                #name: self.#name
+                .as_ref()
+                    .ok_or_else(|| BuilderError::NoneField(stringify!(#name).to_string()))?
+                    .clone(),
+            }
+        }
+    }).collect()
+}
+
+fn create_builder_error() -> TokenStream2 {
+    quote! {
+        #[derive(Debug)]
+        pub enum BuilderError {
+            NoneField(String),
+        }
+
+        impl std::error::Error for BuilderError {}
+
+        impl std::fmt::Display for BuilderError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Self::NoneField(s) => write!(f, "BuilderError::NoneField({})", s)
+                }
+            }
+        }
+    }
+}
+
+fn create_builder_struct(builder_name: &Ident, fields: TokenStream2) -> TokenStream2 {
+    quote! {
+        pub struct #builder_name { #fields }
+    }
+}
+
+fn impl_builder_method_on_struct(struct_name: &Ident, builder_struct_name: &Ident, fields: &TokenStream2) -> TokenStream2 {
+    quote! {
+        impl #struct_name {
+            pub fn builder() -> #builder_struct_name {
+                #builder_struct_name {
+                    #fields
+                }
+            }
+        }
+    }
+}
+
+fn impl_builder_methods(builder_struct_name: &Ident, struct_name: &Ident, struct_fields: &Punctuated<Field, Comma>) -> TokenStream2 {
+    let builder_setters = make_field_setters(struct_fields);
+    let struct_fields_from_builder = populate_builder_fields_with_error_handling(struct_fields);
+    let build_method = make_build_method(struct_name, struct_fields_from_builder);
+
+    quote! {
+        impl #builder_struct_name {
+            #builder_setters
+
+            #build_method
+        }
     }
 }
