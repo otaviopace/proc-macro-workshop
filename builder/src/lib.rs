@@ -17,14 +17,14 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let builder_name = Ident::new(&format!("{}Builder", struct_name), Span::call_site());
     let struct_fields = get_struct_fields(&input.data);
 
-    let fields_with_option = envolve_fields_on_option(&struct_fields);
-    let none_fields = populate_fields_with_none(&struct_fields);
+    let fields_with_option = envolve_fields_on_option(struct_fields);
+    let none_fields = populate_fields_with_none(struct_fields);
 
     let builder_struct_definition = create_builder_struct(&builder_name, fields_with_option);
     let impl_builder_method_on_struct =
         impl_builder_method_on_struct(&struct_name, &builder_name, &none_fields);
 
-    let impl_builder_methods = impl_builder_methods(&builder_name, &struct_name, &struct_fields);
+    let impl_builder_methods = impl_builder_methods(&builder_name, &struct_name, struct_fields);
 
     let builder_error = create_builder_error();
 
@@ -41,10 +41,10 @@ pub fn derive(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-fn get_struct_fields(data: &Data) -> Punctuated<Field, Comma> {
+fn get_struct_fields(data: &Data) -> &Punctuated<Field, Comma> {
     match *data {
         Data::Struct(ref data) => match data.fields {
-            Fields::Named(ref fields) => fields.named.clone(),
+            Fields::Named(ref fields) => &fields.named,
             _ => unimplemented!(),
         },
         _ => unimplemented!(),
@@ -95,14 +95,14 @@ fn is_option(ty: &Type) -> bool {
     false
 }
 
-fn extract_type_from_option(ty: &Type) -> Type {
+fn extract_type_from_option(ty: &Type) -> &Type {
     if let Type::Path(typepath) = ty {
         if let Some(segment) = typepath.path.segments.last() {
             if segment.ident == "Option" {
                 if let PathArguments::AngleBracketed(ref generic_args) = segment.arguments {
                     if let Some(generic_arg) = generic_args.args.first() {
                         if let GenericArgument::Type(t) = generic_arg {
-                            return t.clone();
+                            return t;
                         }
                     }
                 }
@@ -110,7 +110,7 @@ fn extract_type_from_option(ty: &Type) -> Type {
         }
     }
 
-    ty.clone()
+    ty
 }
 
 fn make_field_setters(fields: &Punctuated<Field, Comma>) -> TokenStream2 {
