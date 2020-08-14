@@ -4,11 +4,11 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{
-    parse_macro_input, punctuated::Punctuated, token::Comma, Data, DeriveInput, Field, Fields,
-    GenericArgument, Ident, PathArguments, Type,
+    parse_macro_input, punctuated::Punctuated, token::Comma, Attribute, Data, DeriveInput, Field,
+    Fields, GenericArgument, Ident, Lit, Meta, NestedMeta, PathArguments, Type,
 };
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -77,6 +77,24 @@ fn populate_fields_with_none(fields: &Punctuated<Field, Comma>) -> TokenStream2 
         .collect()
 }
 
+fn is_vec(ty: &Type) -> bool {
+    if let Type::Path(typepath) = ty {
+        if let Some(segment) = typepath.path.segments.last() {
+            if segment.ident == "Vec" {
+                if let PathArguments::AngleBracketed(ref generic_args) = segment.arguments {
+                    if let Some(generic_arg) = generic_args.args.first() {
+                        if let GenericArgument::Type(_) = generic_arg {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn is_option(ty: &Type) -> bool {
     if let Type::Path(typepath) = ty {
         if let Some(segment) = typepath.path.segments.last() {
@@ -113,14 +131,120 @@ fn extract_type_from_option(ty: &Type) -> &Type {
     ty
 }
 
+fn extract_type_from_vec(ty: &Type) -> &Type {
+    if let Type::Path(typepath) = ty {
+        if let Some(segment) = typepath.path.segments.last() {
+            if segment.ident == "Vec" {
+                if let PathArguments::AngleBracketed(ref generic_args) = segment.arguments {
+                    if let Some(generic_arg) = generic_args.args.first() {
+                        if let GenericArgument::Type(t) = generic_arg {
+                            return t;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ty
+}
+
+fn parse_attrs(attrs: &Vec<Attribute>) -> Option<String> {
+    attrs
+        .iter()
+        .map(|a| match a.parse_meta() {
+            Ok(meta) => match meta {
+                Meta::List(ml) => {
+                    let path = &ml.path;
+                    let nested = &ml.nested;
+                    if let Some(segment) = path.segments.last() {
+                        if segment.ident == "builder" {
+                            let nested_meta = nested.iter().next().unwrap();
+                            if let NestedMeta::Meta(m) = nested_meta {
+                                if let Meta::NameValue(name_value) = m {
+                                    if name_value.path.is_ident("each") {
+                                        if let Lit::Str(ref lit_str) = name_value.lit {
+                                            return Some(lit_str.value());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_using_each_attr(attrs: &Vec<Attribute>) -> bool {
+    attrs
+        .iter()
+        .next()
+        .map(|a| match a.parse_meta() {
+            Ok(meta) => match meta {
+                Meta::List(ml) => {
+                    let path = &ml.path;
+                    let nested = &ml.nested;
+                    if let Some(segment) = path.segments.last() {
+                        if segment.ident == "builder" {
+                            let nested_meta = nested.iter().next().unwrap();
+                            if let NestedMeta::Meta(m) = nested_meta {
+                                if let Meta::NameValue(name_value) = m {
+                                    if name_value.path.is_ident("each") {
+                                        if let Lit::Str(_) = name_value.lit {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    false
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
 fn make_field_setters(fields: &Punctuated<Field, Comma>) -> TokenStream2 {
     fields
         .iter()
         .map(|f| {
             let name = &f.ident;
             let ty = &f.ty;
+            let attrs = &f.attrs;
 
             let ty = extract_type_from_option(&ty);
+
+            if is_vec(ty) && is_using_each_attr(attrs) {
+                let ty = extract_type_from_vec(&ty);
+                if let Some(new_arg) = parse_attrs(attrs) {
+                    let new_arg = Ident::new(&new_arg, Span::call_site());
+                    let new_code = quote! {
+                        pub fn #new_arg(&mut self, #new_arg: #ty) -> &mut Self {
+                            match self.#name {
+                                Some(ref mut v) => {
+                                    v.push(#new_arg);
+                                },
+                                None => {
+                                    self.#name = Some(vec![#new_arg]);
+                                },
+                            };
+
+                            self
+                        }
+                    };
+
+                    return new_code;
+                }
+            }
+
             quote! {
                 pub fn #name(&mut self, #name: #ty) -> &mut Self {
                     self.#name = Some(#name);
@@ -153,6 +277,12 @@ fn populate_builder_fields_with_error_handling(fields: &Punctuated<Field, Comma>
             if is_option(ty) {
                 quote! {
                     #name: self.#name.clone(),
+                }
+            } else if is_vec(ty) && is_using_each_attr(&f.attrs) {
+                quote! {
+                    #name: self.#name
+                        .clone()
+                        .unwrap_or_else(|| vec![]),
                 }
             } else {
                 quote! {
