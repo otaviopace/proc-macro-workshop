@@ -4,6 +4,7 @@ use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{
+    MetaList,
     parse_macro_input, punctuated::Punctuated, token::Comma, Attribute, Data, DeriveInput, Field,
     Fields, GenericArgument, Ident, Lit, Meta, NestedMeta, PathArguments, Type,
 };
@@ -24,7 +25,17 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let impl_builder_method_on_struct =
         impl_builder_method_on_struct(&struct_name, &builder_name, &none_fields);
 
-    let impl_builder_methods = impl_builder_methods(&builder_name, &struct_name, struct_fields);
+    eprintln!("heelo");
+    let impl_builder_methods = match impl_builder_methods(&builder_name, &struct_name, struct_fields) {
+        Ok(good) => good,
+        Err(bad) => {
+            let cp = bad.to_compile_error();
+            eprintln!("{}", cp);
+            println!("{}", cp);
+            return cp.into()
+        },
+    };
+    eprintln!("by");
 
     let builder_error = create_builder_error();
 
@@ -149,35 +160,46 @@ fn extract_type_from_vec(ty: &Type) -> &Type {
     ty
 }
 
-fn parse_attrs(attrs: &Vec<Attribute>) -> Option<String> {
+fn get_attrs_metalist(attrs: &Vec<Attribute>) -> Vec<Option<MetaList>> {
     attrs
         .iter()
         .map(|a| match a.parse_meta() {
             Ok(meta) => match meta {
-                Meta::List(ml) => {
-                    let path = &ml.path;
-                    let nested = &ml.nested;
-                    if let Some(segment) = path.segments.last() {
-                        if segment.ident == "builder" {
-                            let nested_meta = nested.iter().next().unwrap();
-                            if let NestedMeta::Meta(m) = nested_meta {
-                                if let Meta::NameValue(name_value) = m {
-                                    if name_value.path.is_ident("each") {
-                                        if let Lit::Str(ref lit_str) = name_value.lit {
-                                            return Some(lit_str.value());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None
-                }
+                Meta::List(ml) => Some(ml),
                 _ => None,
             },
             _ => None,
         })
         .collect()
+}
+
+fn get_metalist_attributes(metalist: &MetaList) -> Result<Option<String>, syn::Error> {
+    let path = &metalist.path;
+    let nested = &metalist.nested;
+    if let Some(segment) = path.segments.last() {
+        match &segment.ident {
+            i if i == "builder" => {
+                let nested_meta = nested.iter().next().unwrap();
+                if let NestedMeta::Meta(m) = nested_meta {
+                    if let Meta::NameValue(name_value) = m {
+                        let span = name_value.path.segments.last().unwrap().ident.span();
+                        if name_value.path.is_ident("each") {
+                            if let Lit::Str(ref lit_str) = name_value.lit {
+                                return Ok(Some(lit_str.value()));
+                            } else {
+                                return Err(syn::Error::new(span, "expected `builder(each = \"...\")`"))
+                            }
+                        } else {
+                            return Err(syn::Error::new(span, "expected `builder(each = \"...\")`"))
+                        }
+                    }
+                }
+            }
+            _ => return Err(syn::Error::new(segment.ident.span(), "expected `builder` attribute"))
+        }
+    }
+
+    Ok(None)
 }
 
 fn is_using_each_attr(attrs: &Vec<Attribute>) -> bool {
@@ -212,7 +234,7 @@ fn is_using_each_attr(attrs: &Vec<Attribute>) -> bool {
         .unwrap_or(false)
 }
 
-fn make_field_setters(fields: &Punctuated<Field, Comma>) -> TokenStream2 {
+fn make_field_setters(fields: &Punctuated<Field, Comma>) -> syn::Result<TokenStream2> {
     fields
         .iter()
         .map(|f| {
@@ -224,33 +246,46 @@ fn make_field_setters(fields: &Punctuated<Field, Comma>) -> TokenStream2 {
 
             if is_vec(ty) && is_using_each_attr(attrs) {
                 let ty = extract_type_from_vec(&ty);
-                if let Some(new_arg) = parse_attrs(attrs) {
-                    let new_arg = Ident::new(&new_arg, Span::call_site());
-                    let new_code = quote! {
-                        pub fn #new_arg(&mut self, #new_arg: #ty) -> &mut Self {
-                            match self.#name {
-                                Some(ref mut v) => {
-                                    v.push(#new_arg);
-                                },
-                                None => {
-                                    self.#name = Some(vec![#new_arg]);
-                                },
-                            };
+                let meta_list = get_attrs_metalist(attrs);
 
-                            self
+                for m in meta_list {
+                    if let Some(m) = m {
+                        match get_metalist_attributes(&m) {
+                            Ok(maybe) => match maybe {
+                                Some(new_arg) => {
+                                    eprintln!("some");
+                                    let new_arg = Ident::new(&new_arg, Span::call_site());
+                                    let new_code = quote! {
+                                        pub fn #new_arg(&mut self, #new_arg: #ty) -> &mut Self {
+                                            match self.#name {
+                                                Some(ref mut v) => {
+                                                    v.push(#new_arg);
+                                                },
+                                                None => {
+                                                    self.#name = Some(vec![#new_arg]);
+                                                },
+                                            };
+
+                                            self
+                                        }
+                                    };
+
+                                    return Ok(new_code);
+                                }
+                                None => {eprintln!("none")}
+                            }
+                            Err(error) => {eprintln!("err");return Err(error)}
                         }
-                    };
-
-                    return new_code;
+                    }
                 }
             }
 
-            quote! {
+            Ok(quote! {
                 pub fn #name(&mut self, #name: #ty) -> &mut Self {
                     self.#name = Some(#name);
                     self
                 }
-            }
+            })
         })
         .collect()
 }
@@ -341,16 +376,16 @@ fn impl_builder_methods(
     builder_struct_name: &Ident,
     struct_name: &Ident,
     struct_fields: &Punctuated<Field, Comma>,
-) -> TokenStream2 {
-    let builder_setters = make_field_setters(struct_fields);
+) -> syn::Result<TokenStream2> {
+    let builder_setters = make_field_setters(struct_fields)?;
     let struct_fields_from_builder = populate_builder_fields_with_error_handling(struct_fields);
     let build_method = make_build_method(struct_name, struct_fields_from_builder);
 
-    quote! {
+    Ok(quote! {
         impl #builder_struct_name {
             #builder_setters
 
             #build_method
         }
-    }
+    })
 }
